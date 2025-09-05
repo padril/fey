@@ -1,19 +1,22 @@
-# Copyright 2024 Leo Peckham
+# Copyright 2025 Leo Peckham
 
 from __future__ import annotations
 from dataclasses import dataclass, field as dataclass_field
-from typing import (
-        Self, overload, Callable, override,
-        Iterator, NewType
-        )
+from typing import Callable, override, Iterator, get_args
+from types import new_class, GenericAlias
+import inspect
+import builtins
 
 def component(value: object) -> Component:
     match value:
         case Component(): return value
         case _: return Lit(value)
 
-def type_repr(t: type | tuple[()] | Fn):
+def type_repr(t: type | GenericAlias | tuple[()] | Fn):
     match t:
+        case GenericAlias():
+            args = ', '.join(type_repr(a) for a in get_args(t))
+            return f"{t.__name__}[{', '.join(args)}]"
         case tuple(): return "tuple[()]"
         case Fn(): return "Fn"
         case _ if hasattr(t, '__name__'): return t.__name__
@@ -22,6 +25,10 @@ def type_repr(t: type | tuple[()] | Fn):
 
 def value_repr(v: object, fn_prefix: str) -> str:
     match v:
+        case slice():
+            s = f"{v.start or ''}:{v.stop or ''}"
+            if v.step: s += f":{v.step}"
+            return s
         case str():
             return '"' + v.encode("unicode_escape").decode("ASCII") + '"'
         case Fn():
@@ -67,7 +74,12 @@ class Component:
         return Expr(component(other), Op('*'), self)
 
     def __getitem__(self, key: object) -> Expr:
-        return Expr(self, GetItem(component(key)))
+        if isinstance(key, slice):
+            return Expr(self, Slice(component(key.start),
+                                    component(key.stop),
+                                    component(key.step)))
+        else:
+            return Expr(self, GetItem(component(key)))
 
     def __call__(self, *args: object) -> Expr:
         return Expr(self, Call(*[component(arg) for arg in args]))
@@ -94,6 +106,12 @@ class GetItem[T](Component):
     key: T
 
 @dataclass
+class Slice[T, U, V](Component):
+    start: T
+    stop: U
+    step: V
+
+@dataclass
 class Arg(Component):
     index: int
 
@@ -117,6 +135,11 @@ class Expr(Component):
                     return f"({args})"
                 case GetItem():
                     return f"[{get_str(component.key)}]"
+                case Slice():
+                    start = get_str(component.start) if component.start else ""
+                    stop = get_str(component.stop) if component.stop else ""
+                    step = get_str(component.step) if component.step else ""
+                    return f"[{start}:{stop}:{step}]"
                 case Expr():
                     return f"({component.as_str(name, arg_prefix, fn_prefix)})"
             assert False, f"Unknown Component {component}"
@@ -140,7 +163,8 @@ class Pattern:
 @dataclass
 class Fn[*In, Out]:
     cases: dict[Pattern, Expr] = dataclass_field(default_factory=dict)
-    types: list[type | tuple[()] | Fn] = dataclass_field(default_factory=list)
+    types: list[type | GenericAlias | tuple[()] | Fn] = dataclass_field(default_factory=list)
+    generics: set[str] = dataclass_field(default_factory=set)
     code: str = ""
     
     @staticmethod
@@ -152,7 +176,8 @@ class Fn[*In, Out]:
     def generate_header(self, name: str, prefix: str) -> str:
         *arg_types, ret_type = self.types
         args = [f"{prefix}{i}: {type_repr(t)}" for i, t in enumerate(arg_types)]
-        header = f"def {name}({', '.join(args)}) -> {type_repr(ret_type)}:"
+        generics = f"[{', '.join(self.generics)}]" if self.generics else ""
+        header = f"def {name}{generics}({', '.join(args)}) -> {type_repr(ret_type)}:"
         return header
 
     def generate_pattern(self, pattern: Pattern, arg_prefix: str,
@@ -257,81 +282,137 @@ class ConstFn(Fn):
         return header + body
 
 class ConstFnFactory:
-    def __truediv__(self, t: type) -> ConstFn:
-        return ConstFn(types=[(), t])
+    def __getattr__(self, t: str) -> ConstFn:
+        frame = inspect.currentframe()
+        assert frame
+        caller_frame = frame.f_back
+        assert caller_frame
+        builtin_types = {name: obj for name, obj in vars(builtins).items()
+                         if isinstance(obj, type)}
+        local_types = {name: obj for name, obj in caller_frame.f_locals.items()
+                       if isinstance(obj, type)}
+        types = builtin_types | local_types
+
+        if t in types:
+            return ConstFn(types=[(), types[t]])
+        else:
+            # support generics
+            raise NotImplementedError
 
 @dataclass
 class FnFactory(tuple[Fn, *tuple[Arg, ...]]):
-    types: list[type | tuple[()] | Fn] = dataclass_field(default_factory=list)
+    types: list[type | GenericAlias | tuple[()] | Fn] = dataclass_field(default_factory=list)
+    generics: set[str] = dataclass_field(default_factory=set)
+    make_new: bool = True
     
-    @overload
-    def __floordiv__(self, t: type | FnFactory) -> Self:
-        ...
-    @overload
-    def __floordiv__(self, t: tuple[()]) -> ConstFnFactory:
-        ...
+    @property
+    def void(self) -> ConstFnFactory:
+        return ConstFnFactory()
 
-    # implementation
-    def __floordiv__(self, t):
-        self.types = []
-        match t:
-            case FnFactory():
-                self.types.append(Fn(types=t.types))
-                return self
-            case type():
-                self.types.append(t)
-                return self
-            case ():
-                return ConstFnFactory()
-        assert False, f"Unknown type {t}"
+    def _(self, t: FnFactory) -> FnFactory:
+        if self.make_new:
+            factory = FnFactory()
+            factory.make_new = False
+        else:
+            factory = self
+        factory.types.append(Fn(types=t.types))
+        return factory
 
-    def __truediv__(self, t: type) -> Self:
-        self.types.append(t)
-        return self
+    @property
+    def of(self):
+        factory = self
+        class Cls:
+            def __getattr__(self, t: str) -> FnFactory:
+                frame = inspect.currentframe()
+                assert frame
+                caller_frame = frame.f_back
+                assert caller_frame
+                builtin_types = {name: obj for name, obj in vars(builtins).items()
+                                 if isinstance(obj, type)}
+                local_types = {name: obj for name, obj in caller_frame.f_locals.items()
+                               if isinstance(obj, type)}
+                types = builtin_types | local_types
 
-    @override
+                if t in types:
+                    u = factory.types[-1]
+                    assert not isinstance(u, Fn) and hasattr(u, "__class_getitem__")
+                    factory.types[-1] = u.__class_getitem__(types[t])
+                    return factory
+                else:
+                    u = factory.types[-1]
+                    assert not isinstance(u, Fn) and hasattr(u, "__class_getitem__")
+                    factory.types[-1] = u.__class_getitem__(new_class(t))
+                    factory.generics |= {t}
+                    return factory
+        return Cls()
+
+    def __getattr__(self, t: str) -> FnFactory:
+        factory: FnFactory
+        if self.make_new:
+            factory = FnFactory()
+            factory.make_new = False
+        else:
+            factory = self
+        frame = inspect.currentframe()
+        assert frame
+        caller_frame = frame.f_back
+        assert caller_frame
+        builtin_types = {name: obj for name, obj in vars(builtins).items()
+                         if isinstance(obj, type)}
+        local_types = {name: obj for name, obj in caller_frame.f_locals.items()
+                       if isinstance(obj, type)}
+        types = builtin_types | local_types
+
+        if t in types:
+            factory.types.append(types[t])
+            return factory
+        else:
+            factory.types.append(new_class(t))
+            factory.generics |= {t}
+            return factory
+
     def __iter__(self) -> Iterator[Fn | Arg]:
-        return iter([Fn(types=self.types)] +
+        return iter([Fn(types=self.types, generics=self.generics)] +
                     [Arg(i) for i in range(len(self.types) - 1)])
 
 fn = FnFactory()
 
 if __name__ == "__main__":
-    hello = fn // () / str
+    hello = fn . void . int
     hello [()] = "Hello, world!"
 
     assert hello() == "Hello, world!"
 
-    add, x, y = fn // int / int / int
+    add, x, y = fn . int . int . int
     add [x, y] = x + y
 
     assert add(3, 5) == 8
 
-    greet, name = fn // str / str
+    greet, name = fn . str . str
     greet ["Bob"] = "Long time no see, ol' pal!"
     greet [name] = "Nice to meet you, " + name
 
     assert greet("John") == "Nice to meet you, John"
 
-    inc, n = fn // int / int
+    inc, n = fn . int . int
     inc [n] = n + 1
     
     assert inc(0) == 1
 
-    f, x, y = fn // int / int / int
+    f, x, y = fn . int . int . int
     f [x, y] = add(2 * x, 2 * y) + 1
 
     assert f(3, 4) == 15
 
-    fib, n = fn // int / int
+    fib, n = fn . int . int
     fib [0] = 0
     fib [1] = 1
     fib [n] = fib(n - 1) + fib(n - 2)
 
     assert fib(6) == 8
 
-    alpha, a = fn // int / int
-    beta, b = fn // int / int
+    alpha, a = fn . int . int
+    beta, b = fn . int . int
 
     alpha [0] = 0
     alpha [a] = beta(a - 1) + 1
@@ -348,12 +429,31 @@ if __name__ == "__main__":
     #         = 6
     assert beta(5) == 6
 
-    # TODO: Better generics
-    a = type(NewType('a', object))
-    b = type(NewType('b', object))
-    foldr, f, z, xs = fn // (fn // a / b / b) / a / list[b] / b
+    foldr, f, z, xs = fn ._ (fn . a . b . b) . a . list.of.b . b
     foldr [f, z, []] = z
     foldr [f, z, xs] = f(xs[0], foldr(f, z, xs[1:]))
 
     assert foldr(add, 0, [1,2,3,4,5]) == 15
+
+    takeby, xs, n = fn . list.of.a . int . list.of.a
+    takeby [xs, n] = xs[::n]
+    
+    # TODO: add lambda expression
+    # assert fn ("Hello " + x for x in lm) ("World") == "Hello World"
+    # assert fn (x + y for x, y in lm) (3, 4) == 7
+
+    # TODO: add currying
+    # assert add (1) (2) == 3
+
+    # TODO: add pipes
+
+    # TODO: add dummy __
+
+    # TODO: add (foo@fn) notation to convert exisitng functions
+
+    # TODO: add @fn decorator
+
+    # TODO: get this to run
+    # ([1, 2] * 20) | takeby | fn (map (x) (1,2) for x in lm) | (sum@fn)(__, [])
+    # should be equal to sum((lambda x: (x[::2], x[1::2]))([1, 2] * 20), [])
 
