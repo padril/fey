@@ -4,8 +4,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field as dataclass_field
 from typing import Callable, override, Iterator, get_args
 from types import new_class, GenericAlias
+from abc import abstractmethod, ABC
+import sys
 import inspect
 import builtins
+import typeguard
+import tempfile
+import importlib.util
 
 def component(value: object) -> Component:
     match value:
@@ -57,7 +62,7 @@ class Scope:
 
 SCOPE = Scope()
 
-class Component:
+class Component(ABC):
     def __add__(self, other: object) -> Expr:
         return Expr(self, Op('+'), component(other))
 
@@ -84,6 +89,10 @@ class Component:
     def __call__(self, *args: object) -> Expr:
         return Expr(self, Call(*[component(arg) for arg in args]))
 
+    @abstractmethod
+    def num_args(self) -> int:
+        ...
+
 @dataclass
 class Lit[T](Component):
     value: T
@@ -91,9 +100,15 @@ class Lit[T](Component):
     def __repr__(self) -> str:
         return f"lit({self.value})"
 
+    def num_args(self) -> int:
+        return 0
+
 @dataclass
 class Op(Component):
     value: str
+
+    def num_args(self) -> int:
+        return 0
 
 class Call(Component):
     args: list[Component]
@@ -101,9 +116,18 @@ class Call(Component):
     def __init__(self, *args: Component) -> None:
         self.args = list(args)
 
+    def num_args(self) -> int:
+        return sum(a.num_args() for a in self.args)
+
 @dataclass
 class GetItem[T](Component):
     key: T
+
+    def num_args(self) -> int:
+        if isinstance(self.key, Component):
+            return self.key.num_args()
+        else:
+            return 0
 
 @dataclass
 class Slice[T, U, V](Component):
@@ -111,12 +135,25 @@ class Slice[T, U, V](Component):
     stop: U
     step: V
 
+    def num_args(self) -> int:
+        total = 0
+        if isinstance(self.start, Component):
+            total += self.start.num_args()
+        if isinstance(self.stop, Component):
+            total += self.stop.num_args()
+        if isinstance(self.step, Component):
+            total += self.step.num_args()
+        return total
+
 @dataclass
 class Arg(Component):
     index: int
 
     def __repr__(self) -> str:
         return f"arg_{self.index}"
+
+    def num_args(self) -> int:
+        return 1
 
 class Expr(Component):
     components: list[Component]
@@ -150,6 +187,9 @@ class Expr(Component):
     def __repr__(self) -> str:
         return f"Expr( {self.as_str('rec', 'z', 'f')} )"
 
+    def num_args(self) -> int:
+        return sum(c.num_args() for c in self.components)
+
 class Pattern:
     pattern: list[object]
     
@@ -159,7 +199,6 @@ class Pattern:
     def __repr__(self) -> str:
         return f"Pattern({', '.join(map(repr, self.pattern))})"
 
-# TODO: Fn should type check a lot more strongly
 @dataclass
 class Fn[*In, Out]:
     cases: dict[Pattern, Expr] = dataclass_field(default_factory=dict)
@@ -212,20 +251,29 @@ class Fn[*In, Out]:
         return glob + header + body
 
     def make_fn(self) -> None:
-        name = "fn"
+        name = "fnc"
         arg_prefix = "z"
         fn_prefix = "f"
+        module_name = "_anon_"
 
         self.code = self.generate_fn(name, arg_prefix, fn_prefix)
+        
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write(self.code)
+            fname = f.name
 
-        d = SCOPE.dict()
+        spec = importlib.util.spec_from_file_location(module_name, fname)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
 
-        exec(self.code, d)
+        module.__dict__.update(SCOPE.dict())
+        module.__dict__.update({'Fn': Fn})
 
-        # we have to type ignore here, because of the way scope works and
-        # how the code is generated
-        # TODO: make a manual check that fn's annotations fit *In and Out
-        self.fn = d[name]  # type: ignore
+        spec.loader.exec_module(module)
+
+        fn = getattr(module, name)
+        self.fn = typeguard.typechecked(fn)
 
     # TODO: Currying
     def __call__(self, *args: *In) -> Out | Component:
@@ -375,10 +423,59 @@ class FnFactory(tuple[Fn, *tuple[Arg, ...]]):
         return iter([Fn(types=self.types, generics=self.generics)] +
                     [Arg(i) for i in range(len(self.types) - 1)])
 
+    def __call__(self, gen: Iterator[object]) -> Fn:
+        fn = Fn()
+        cmp = next(gen)
+
+        expr: Expr
+        match cmp:
+            case Component():
+                expr = Expr(cmp)
+            case _:
+                expr = Expr(Lit(cmp))
+
+        n = expr.num_args()
+        if n == 0:
+            fn.cases[Pattern(())] = expr
+            fn.types = []
+            fn.generics = set()
+        else:
+            fn.cases[Pattern(*[Arg(i) for i in range(n)])] = expr
+            generics = [f"t{i}" for i in range(n + 1)]
+            fn.types = [new_class(t) for t in generics]
+            fn.generics = set(generics)
+        fn.make_fn()
+
+        return fn
+
+
+class Lambda:
+    def __iter__(self) -> Iterator[Arg]:# | tuple[Arg, ...]]:
+        frame = inspect.currentframe()
+        assert frame
+        frame = frame.f_back
+        assert frame
+        import dis
+        code = frame.f_code
+
+        unpack_count = None
+        for ins in dis.get_instructions(code):
+            if ins.offset < frame.f_lasti:
+                continue
+            if ins.opname in ("UNPACK_SEQUENCE", "UNPACK_EX"):
+                unpack_count = ins.arg
+                break
+        if unpack_count is None or unpack_count == 1:
+            yield Arg(0)
+        else:
+            # we have to type ignore this because unpack count is dynamic
+            yield tuple(Arg(i) for i in range(unpack_count)) # type: ignore
+
 fn = FnFactory()
+lm = Lambda()
 
 if __name__ == "__main__":
-    hello = fn . void . int
+    hello = fn . void . str
     hello [()] = "Hello, world!"
 
     assert hello() == "Hello, world!"
@@ -438,9 +535,8 @@ if __name__ == "__main__":
     takeby, xs, n = fn . list.of.a . int . list.of.a
     takeby [xs, n] = xs[::n]
     
-    # TODO: add lambda expression
-    # assert fn ("Hello " + x for x in lm) ("World") == "Hello World"
-    # assert fn (x + y for x, y in lm) (3, 4) == 7
+    assert fn ("Hello " + x for x in lm) ("World") == "Hello World"
+    assert fn (x + y for x, y in lm) (3, 4) == 7
 
     # TODO: add currying
     # assert add (1) (2) == 3
