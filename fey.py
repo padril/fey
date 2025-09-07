@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field as dataclass_field
-from typing import Callable, override, Iterator, get_args
-from types import new_class, GenericAlias
-from abc import abstractmethod, ABC
+from typing import Callable, override, Iterator, get_args, overload
+from types import (
+        new_class, GenericAlias, BuiltinFunctionType, LambdaType, FunctionType
+        )
+from abc import ABC, abstractmethod
 import sys
 import inspect
 import builtins
 import typeguard
 import tempfile
 import importlib.util
+from functools import partial
 
 def component(value: object) -> Component:
     match value:
@@ -90,7 +93,11 @@ class Component(ABC):
         return Expr(self, Call(*[component(arg) for arg in args]))
 
     @abstractmethod
-    def num_args(self) -> int:
+    def replace(self, index: int, value: Component) -> Component:
+        ...
+
+    @abstractmethod
+    def downindex(self, by: int) -> Component:
         ...
 
 @dataclass
@@ -100,15 +107,21 @@ class Lit[T](Component):
     def __repr__(self) -> str:
         return f"lit({self.value})"
 
-    def num_args(self) -> int:
-        return 0
+    def replace(self, index: int, value: Component) -> Lit:
+        return self
+
+    def downindex(self, by: int) -> Lit:
+        return self
 
 @dataclass
 class Op(Component):
     value: str
 
-    def num_args(self) -> int:
-        return 0
+    def replace(self, index: int, value: Component) -> Op:
+        return self
+
+    def downindex(self, by: int) -> Op:
+        return self
 
 class Call(Component):
     args: list[Component]
@@ -116,18 +129,27 @@ class Call(Component):
     def __init__(self, *args: Component) -> None:
         self.args = list(args)
 
-    def num_args(self) -> int:
-        return sum(a.num_args() for a in self.args)
+    def replace(self, index: int, value: Component) -> Call:
+        return Call(*[a.replace(index, value) for a in self.args])
+
+    def downindex(self, by: int) -> Call:
+        return Call(*[a.downindex(by) for a in self.args])
 
 @dataclass
 class GetItem[T](Component):
     key: T
 
-    def num_args(self) -> int:
+    def replace(self, index: int, value: Component) -> GetItem:
         if isinstance(self.key, Component):
-            return self.key.num_args()
+            return GetItem(self.key.replace(index, value))
         else:
-            return 0
+            return self
+
+    def downindex(self, by: int) -> GetItem:
+        if isinstance(self.key, Component):
+            return GetItem(self.key.downindex(by))
+        else:
+            return self
 
 @dataclass
 class Slice[T, U, V](Component):
@@ -135,15 +157,30 @@ class Slice[T, U, V](Component):
     stop: U
     step: V
 
-    def num_args(self) -> int:
-        total = 0
-        if isinstance(self.start, Component):
-            total += self.start.num_args()
-        if isinstance(self.stop, Component):
-            total += self.stop.num_args()
-        if isinstance(self.step, Component):
-            total += self.step.num_args()
-        return total
+    def replace(self, index: int, value: Component) -> Slice:
+        start = self.start
+        if isinstance(start, Component):
+            start = start.replace(index, value)
+        stop = self.stop
+        if isinstance(stop, Component):
+            stop = stop.replace(index, value)
+        step = self.step
+        if isinstance(step, Component):
+            step = step.replace(index, value)
+        return Slice(start, stop, step)
+
+    def downindex(self, by: int) -> Slice:
+        start = self.start
+        if isinstance(start, Component):
+            start = start.downindex(by)
+        stop = self.stop
+        if isinstance(stop, Component):
+            stop = stop.downindex(by)
+
+        step = self.step
+        if isinstance(step, Component):
+            step = step.downindex(by)
+        return Slice(start, stop, step)
 
 @dataclass
 class Arg(Component):
@@ -152,8 +189,14 @@ class Arg(Component):
     def __repr__(self) -> str:
         return f"arg_{self.index}"
 
-    def num_args(self) -> int:
-        return 1
+    def replace[T: Component](self, index: int, value: T) -> T | Arg:
+        if self.index == index:
+            return value
+        else:
+            return self
+
+    def downindex(self, by: int) -> Arg:
+        return Arg(self.index - by)
 
 class Expr(Component):
     components: list[Component]
@@ -187,8 +230,11 @@ class Expr(Component):
     def __repr__(self) -> str:
         return f"Expr( {self.as_str('rec', 'z', 'f')} )"
 
-    def num_args(self) -> int:
-        return sum(c.num_args() for c in self.components)
+    def replace(self, index: int, value: Component) -> Expr:
+        return Expr(*[c.replace(index, value) for c in self.components])
+
+    def downindex(self, by: int) -> Expr:
+        return Expr(*[c.downindex(by) for c in self.components])
 
 class Pattern:
     pattern: list[object]
@@ -205,6 +251,7 @@ class Fn[*In, Out]:
     types: list[type | GenericAlias | tuple[()] | Fn] = dataclass_field(default_factory=list)
     generics: set[str] = dataclass_field(default_factory=set)
     code: str = ""
+    saved: list[object] = dataclass_field(default_factory=list)
     
     @staticmethod
     def default_fn(*_: *In) -> Out:
@@ -275,12 +322,49 @@ class Fn[*In, Out]:
         fn = getattr(module, name)
         self.fn = typeguard.typechecked(fn)
 
-    # TODO: Currying
-    def __call__(self, *args: *In) -> Out | Component:
+    @overload
+    def __call__(self, *args: Component) -> Expr:
+        ...
+
+    @overload
+    def __call__(self, *args: *In) -> Out | Fn:
+        ...
+
+    def __call__(self, *args):
         if any(isinstance(arg, Component) for arg in args):
-            return Lit(self)(*args)
+            return Expr(Lit(self), Call(*args))
+        elif self.fn == self.default_fn:
+            self.saved += args
+            return self
+        elif len(self.types) == 2 and self.types[0] == ():
+            # We gotta type ignore this because *In is so finicky
+            return self.fn(*args) # type: ignore
+        elif len(args) < len(self.types) - 1:
+            cp = Fn()
+            n = len(args)
+            cp.types = self.types[n:]
+            cp.generics = self.generics - set(getattr(t, "__name__")
+                                              for t in self.types[:n]
+                                              if hasattr(t, "__name__"))
+            if not self.cases:
+                # this was a builtin or other weird thing
+                cp.fn = partial(self.fn, *args)
+            else:
+                for pat, cmp in self.cases.items():
+                    new_pat = Pattern(*[
+                        val.downindex(n) if isinstance(val, Arg) else val
+                        for val in pat.pattern[n:]
+                        ])
+                    new_cmp = cmp
+                    for i in range(n):
+                        new_cmp = new_cmp.replace(i, Lit(args[i]))
+                    new_cmp = new_cmp.downindex(n)
+                    cp.cases[new_pat] = new_cmp
+                cp.make_fn()
+            return cp
         else:
-            return self.fn(*args)
+            # We gotta type ignore this because *In is so finicky
+            return self.fn(*args) # type: ignore
 
     def __setitem__(self, key: object, value: object) -> None:
         pattern: Pattern
@@ -297,7 +381,45 @@ class Fn[*In, Out]:
         self.make_fn()
 
     def __repr__(self) -> str:
-        return " -> ".join(map(type_repr, self.types))
+        return " -> ".join(f"({repr(t)})"
+                           if isinstance(t, Fn)
+                           else type_repr(t)
+                           for t in self.types)
+
+    def __rmatmul__[U](self, other: Callable[..., U]) -> U | Fn[object, U] | Component:
+        f = fn._call_fn(other)
+        if self.fn == self.default_fn:
+            return f(*self.saved)
+        else:
+            return f(self.fn)
+
+    def __or__(self, other: Fn) -> Out | Fn:
+        return other(self)
+
+    # composition
+    def __and__(self, other: Fn) -> Fn:
+        f = Fn()
+        res = self.types[-1]
+        assert len(other.types) >= 0
+        fst = other.types[0]
+        # TODO: need a better way to compare two type signatures
+        if isinstance(fst, GenericAlias):
+            # replace all instances of fst with res in other
+            ...
+        elif isinstance(fst, Fn):
+            # replace all instances ...
+            ...
+        elif isinstance(res, fst):
+            ...
+        f.types = self.types[:-1] + other.types[1:]
+        # TODO: this needs to be better
+        def cls(*args):
+            return self.fn(other.fn(*args))
+        f.fn = cls
+        return f
+
+    def __ror__(self, *other: *In) -> Out | Fn:
+        return self(*other)
 
 @dataclass
 class ConstFn(Fn):
@@ -363,7 +485,7 @@ class FnFactory(tuple[Fn, *tuple[Arg, ...]]):
             factory.make_new = False
         else:
             factory = self
-        factory.types.append(Fn(types=t.types))
+        factory.types.append(Fn(types=t.types.copy()))
         return factory
 
     @property
@@ -420,59 +542,53 @@ class FnFactory(tuple[Fn, *tuple[Arg, ...]]):
             return factory
 
     def __iter__(self) -> Iterator[Fn | Arg]:
-        return iter([Fn(types=self.types, generics=self.generics)] +
+        return iter([Fn(types=self.types.copy(), generics=self.generics.copy())] +
                     [Arg(i) for i in range(len(self.types) - 1)])
 
-    def __call__(self, gen: Iterator[object]) -> Fn:
-        fn = Fn()
-        cmp = next(gen)
-
-        expr: Expr
-        match cmp:
-            case Component():
-                expr = Expr(cmp)
-            case _:
-                expr = Expr(Lit(cmp))
-
-        n = expr.num_args()
-        if n == 0:
-            fn.cases[Pattern(())] = expr
-            fn.types = []
-            fn.generics = set()
+    def _call_fn[*In, Out](self, f_in: Callable[[*In], Out]) -> Fn[*In, Out]:
+        f = Fn[*In, Out]()
+        if (isinstance(f_in, BuiltinFunctionType)
+            or isinstance(f_in, LambdaType)):
+            f.fn = f_in
         else:
-            fn.cases[Pattern(*[Arg(i) for i in range(n)])] = expr
-            generics = [f"t{i}" for i in range(n + 1)]
-            fn.types = [new_class(t) for t in generics]
-            fn.generics = set(generics)
-        fn.make_fn()
-
-        return fn
-
-
-class Lambda:
-    def __iter__(self) -> Iterator[Arg]:# | tuple[Arg, ...]]:
-        frame = inspect.currentframe()
-        assert frame
-        frame = frame.f_back
-        assert frame
-        import dis
-        code = frame.f_code
-
-        unpack_count = None
-        for ins in dis.get_instructions(code):
-            if ins.offset < frame.f_lasti:
+            f.fn = typeguard.typechecked(f_in)
+        if not isinstance(f.fn, FunctionType):
+            sig = inspect.signature(f.fn.__call__)
+        else:
+            sig = inspect.signature(f.fn)
+        f.cases = {}
+        if self.types:
+            f.types = self.types.copy()
+            return f
+        for p in sig.parameters.values():
+            if p.kind not in {p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD}:
+                # TODO: We need to be able to handle non-positional entries
                 continue
-            if ins.opname in ("UNPACK_SEQUENCE", "UNPACK_EX"):
-                unpack_count = ins.arg
-                break
-        if unpack_count is None or unpack_count == 1:
-            yield Arg(0)
+            if p.annotation == inspect._empty:
+                t = f"t{len(f.generics)}"
+                f.generics |= {t}
+                f.types.append(new_class(t))
+            else:
+                f.types.append(p.annotation)
+        f.types.append(sig.return_annotation)
+        return f
+
+    def _call_save(self, args: tuple[object, ...]) -> Fn:
+        f = Fn()
+        f.saved += args
+        return f
+
+    def __call__(self, *args: object) -> Fn:
+        if len(args) == 1 and isinstance(args[0], Callable):
+            return self._call_fn(args[0])
         else:
-            # we have to type ignore this because unpack count is dynamic
-            yield tuple(Arg(i) for i in range(unpack_count)) # type: ignore
+            return self._call_save(args)
+
+    def __rmatmul__(self, other: Callable) -> Fn:
+        f = self._call_fn(other)
+        return f
 
 fn = FnFactory()
-lm = Lambda()
 
 if __name__ == "__main__":
     hello = fn . void . str
@@ -484,6 +600,8 @@ if __name__ == "__main__":
     add [x, y] = x + y
 
     assert add(3, 5) == 8
+    assert type(add(1)) == Fn
+    assert add (1) (2) == 3
 
     greet, name = fn . str . str
     greet ["Bob"] = "Long time no see, ol' pal!"
@@ -532,24 +650,40 @@ if __name__ == "__main__":
 
     assert foldr(add, 0, [1,2,3,4,5]) == 15
 
-    takeby, xs, n = fn . list.of.a . int . list.of.a
-    takeby [xs, n] = xs[::n]
+    takeby, k, xs, n = fn . int . list.of.a . int . list.of.a
+    takeby [k, xs, n] = xs[n::k]
+
+    @fn
+    def foo(x: int, y) -> float:
+        return x / int(y)
+    assert type(foo) == Fn
+    assert foo(1, "2") == (1 / int("2"))
     
-    assert fn ("Hello " + x for x in lm) ("World") == "Hello World"
-    assert fn (x + y for x, y in lm) (3, 4) == 7
+    assert type(sum@fn) == Fn
+    assert (sum@fn)([1,2,3]) == 6
 
-    # TODO: add currying
-    # assert add (1) (2) == 3
+    assert (lambda x: "Hello " + x)@fn ("World") == "Hello World"
+    assert (lambda x, y: x + y)@fn (3, 4) == 7
 
-    # TODO: add pipes
+    # edge case we should still allow
+    assert (lambda f: f(123))@fn (str) == "123"
 
     # TODO: add dummy __
 
-    # TODO: add (foo@fn) notation to convert exisitng functions
+    @fn
+    def show(val):
+        print(val)
+        return val
 
-    # TODO: add @fn decorator
+    # map needs to be typed to work
+    mapfn = map@(fn ._ (fn . a . b) . list.of.a . b)
+    listfn = list@(fn . a . list.of.b)
+
+    assert (([1, 2] * 5)
+            | takeby(2)
+            | ((lambda xs: sum(xs, []))@fn & listfn & mapfn)
+           )([0,1]) == [1,1,1,1,1,2,2,2,2,2]
 
     # TODO: get this to run
-    # ([1, 2] * 20) | takeby | fn (map (x) (1,2) for x in lm) | (sum@fn)(__, [])
+    # ([1, 2] * 20) | takeby | (lambda x: (map@fn) (x) ([1,2]))@fn | (sum@fn)(__, [])
     # should be equal to sum((lambda x: (x[::2], x[1::2]))([1, 2] * 20), [])
-
